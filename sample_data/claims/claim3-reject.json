@@ -1,0 +1,11 @@
+{
+  "employee_id": "EMP003",
+  "trip_type": "Domestic",
+  "expenses": [
+    {
+      "category": "Alcohol",
+      "amount": 1500,
+      "receipt": true
+    }
+  ]
+}

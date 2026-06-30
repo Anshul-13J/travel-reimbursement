@@ -1,0 +1,11 @@
+{
+  "employee_id": "EMP005",
+  "receipt_id": "REC-1001",
+  "expenses": [
+    {
+      "category": "Hotel",
+      "amount": 5000,
+      "receipt": true
+    }
+  ]
+}

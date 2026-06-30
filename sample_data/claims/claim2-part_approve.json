@@ -1,0 +1,12 @@
+{
+  "employee_id": "EMP002",
+  "trip_type": "Domestic",
+  "city": "Mumbai",
+  "expenses": [
+    {
+      "category": "Hotel",
+      "amount": 8000,
+      "receipt": true
+    }
+  ]
+}

@@ -1,0 +1,17 @@
+{
+  "employee_id": "EMP001",
+  "trip_type": "Domestic",
+  "city": "Pune",
+  "expenses": [
+    {
+      "category": "Hotel",
+      "amount": 4500,
+      "receipt": true
+    },
+    {
+      "category": "Taxi",
+      "amount": 800,
+      "receipt": true
+    }
+  ]
+}

@@ -1,0 +1,12 @@
+{
+  "employee_id": "EMP004",
+  "trip_type": "International",
+  "expenses": [
+    {
+      "category": "Flight",
+      "class": "Business",
+      "amount": 120000,
+      "receipt": false
+    }
+  ]
+}
