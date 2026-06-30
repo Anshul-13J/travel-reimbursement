@@ -1,3 +1,13 @@
 streamlit
 requests
 dotenv
+paddleocr
+paddlepaddle
+fastapi
+uvicorn
+langchain
+langchain-core
+langchain-community
+langchain-ollama
+pydantic
+python-dateutil

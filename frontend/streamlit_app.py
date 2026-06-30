@@ -50,13 +50,9 @@ CATEGORIES = [
     "Flight",
     "Train",
     "Hotel",
-    "Taxi",
-    "Bus",
-    "Metro",
+    "Transport",
     "Meals",
-    "Parking",
     "Internet",
-    "Conference",
     "Visa",
     "Others"
 ]
@@ -151,56 +147,46 @@ left, divider, right = st.columns(
 # LEFT PANEL
 # ==================================================
 with left:
-
     st.subheader(
         "Upload Receipts"
     )
-
     uploaded_files = st.file_uploader(
-        "Upload upto 10 receipts",
+        "Upload upto 15 receipts",
         type=[
             "jpg",
             "jpeg",
             "png",
             "pdf"
         ],
-        accept_multiple_files=True
+        accept_multiple_files=True,
+        max_upload_size= 10
     )
-
     if uploaded_files:
-
-        if len(uploaded_files) > 10:
+        if len(uploaded_files) > 15:
             st.error(
-                "Maximum 10 receipts allowed."
+                "Maximum 15 receipts allowed."
             )
             st.stop()
-
         if st.button(
             "Process Receipts",
             use_container_width=True
         ):
-
             progress = st.progress(0)
             status = st.empty()
-
             parsed = []
-
             with st.status(
                 "Processing Receipts...",
                 expanded=True
             ):
-
                 for idx, file in enumerate(
                     uploaded_files
                 ):
-
                     status.info(
                         f"Processing "
                         f"{idx+1}/"
                         f"{len(uploaded_files)}: "
                         f"{file.name}"
                     )
-
                     files = {
                         "file": (
                             file.name,
@@ -231,43 +217,24 @@ with left:
                                 f"✓ "
                                 f"{file.name}"
                             )
-
+                            receipt = response.json()
+                            print(response)
+                            print(receipt)
                             parsed.append(
                                 {
-                                    "receipt_name":
-                                        file.name,
-                                    "category":
-                                        ocr.get(
-                                            "category",
-                                            "Others"
-                                        ),
-                                    "vendor":
-                                        ocr.get(
-                                            "vendor",
-                                            ""
-                                        ),
-                                    "amount":
-                                        float(
-                                            ocr.get(
-                                                "amount",
-                                                0
-                                            )
-                                        ),
-                                    "date":
-                                        ocr.get(
-                                            "date",
-                                            date.today()
-                                            .strftime(
-                                                "%d-%m-%Y"
-                                            )
-                                        ),
-                                    "other_category":
-                                        ""
+                                    "receipt_id": receipt["receipt_id"],
+                                    "receipt_name": receipt["receipt_name"],
+                                    "category": receipt["category"],
+                                    "vendor": receipt["vendor"],
+                                    "amount": float(receipt["amount"]),
+                                    "date": receipt["date"],
+                                    "confidence": receipt["confidence"],
+                                    "findings": receipt["findings"],
+                                    "explanation": receipt["explanation"],
+                                    "other_category": ""
                                 }
                             )
-
                         else:
-
                             st.error(
                                 f"✗ "
                                 f"{file.name}"
@@ -326,171 +293,289 @@ with right:
         st.session_state.expenses
     ):
 
+        receipt_id = expense.get(
+            "receipt_id",
+            f"manual_{idx}"
+        )
+
+        # -----------------------------------------
+        # Initialize widget state only once
+        # -----------------------------------------
+        category_key = (
+            f"cat_{receipt_id}"
+        )
+        vendor_key = (
+            f"vendor_{receipt_id}"
+        )
+        amount_key = (
+            f"amount_{receipt_id}"
+        )
+        date_key = (
+            f"date_{receipt_id}"
+        )
+        other_key = (
+            f"other_{receipt_id}"
+        )
+
+        if category_key not in st.session_state:
+            st.session_state[
+                category_key
+            ] = expense.get(
+                "category",
+                "Others"
+            )
+
+        if vendor_key not in st.session_state:
+            st.session_state[
+                vendor_key
+            ] = expense.get(
+                "vendor",
+                ""
+            )
+
+        if amount_key not in st.session_state:
+            st.session_state[
+                amount_key
+            ] = float(
+                expense.get(
+                    "amount",
+                    0
+                )
+            )
+
+        if date_key not in st.session_state:
+
+            try:
+                st.session_state[
+                    date_key
+                ] = datetime.strptime(
+                    expense.get(
+                        "date",
+                        date.today()
+                        .strftime(
+                            "%d-%m-%Y"
+                        )
+                    ),
+                    "%d-%m-%Y"
+                ).date()
+
+            except Exception:
+
+                st.session_state[
+                    date_key
+                ] = date.today()
+
+        if other_key not in st.session_state:
+            st.session_state[
+                other_key
+            ] = expense.get(
+                "other_category",
+                ""
+            )
+
         with st.container(
             border=True
         ):
 
-            h1, h2 = st.columns(
-                [10, 1]
+            header, delete = (
+                st.columns(
+                    [10, 1]
+                )
             )
 
-            with h1:
-
-                title = (
-                    expense
-                    .get(
-                        "receipt_name",
-                        f"Expense "
-                        f"{idx+1}"
-                    )
-                )
+            with header:
 
                 st.markdown(
-                    f"### {title}"
+                    f"### "
+                    f"{expense.get('receipt_name', f'Expense {idx+1}')}"
                 )
 
-            with h2:
+            with delete:
 
                 if st.button(
                     "🗑️",
-                    key=f"del_{idx}"
+                    key=f"delete_{receipt_id}"
                 ):
                     delete_index = idx
 
-            c1, c2 = st.columns(2)
+            col1, col2 = st.columns(
+                2
+            )
 
-            with c1:
+            # =====================================
+            # LEFT COLUMN
+            # =====================================
+            with col1:
 
-                current = (
-                    expense[
-                        "category"
-                    ]
-                    if expense[
-                        "category"
-                    ]
-                    in CATEGORIES
-                    else "Others"
-                )
-
-                expense[
-                    "category"
-                ] = st.selectbox(
-                    "Category",
-                    CATEGORIES,
-                    index=CATEGORIES
-                    .index(
-                        current
-                    ),
-                    key=f"cat_{idx}"
+                current_category = (
+                    st.selectbox(
+                        "Category",
+                        CATEGORIES,
+                        key=category_key
+                    )
                 )
 
                 if (
-                    expense[
-                        "category"
-                    ]
+                    current_category
                     == "Others"
                 ):
 
-                    expense[
-                        "other_category"
-                    ] = st.text_input(
+                    st.text_input(
                         "Specify Category",
-                        value=expense
-                        .get(
-                            "other_category",
-                            ""
-                        ),
-                        key=f"other_{idx}"
+                        key=other_key
                     )
 
-                expense[
-                    "amount"
-                ] = st.number_input(
+                st.number_input(
                     "Amount",
-                    value=float(
-                        expense[
-                            "amount"
-                        ]
-                    ),
                     format="%.2f",
                     step=None,
-                    key=f"amt_{idx}"
+                    key=amount_key
                 )
 
-            with c2:
+            # =====================================
+            # RIGHT COLUMN
+            # =====================================
+            with col2:
 
-                expense[
-                    "vendor"
-                ] = st.text_input(
+                st.text_input(
                     "Vendor",
-                    value=expense[
-                        "vendor"
-                    ],
-                    key=f"vendor_{idx}"
+                    key=vendor_key
                 )
 
-                current_date = (
-                    datetime
-                    .strptime(
+                st.date_input(
+                    "Date",
+                    format="DD/MM/YYYY",
+                    key=date_key
+                )
+
+            # =====================================
+            # AI ANALYSIS
+            # =====================================
+            with st.expander(
+                "AI Analysis"
+            ):
+
+                confidence = (
+                    expense.get(
+                        "confidence",
+                        0
+                    )
+                )
+
+                st.metric(
+                    "Confidence",
+                    f"{confidence*100:.0f}%"
+                )
+
+                if expense.get(
+                    "findings"
+                ):
+
+                    st.subheader(
+                        "Findings"
+                    )
+
+                    for finding in (
                         expense[
-                            "date"
-                        ],
-                        "%d-%m-%Y"
-                    )
-                    .date()
-                )
+                            "findings"
+                        ]
+                    ):
 
-                selected = (
-                    st.date_input(
-                        "Date",
-                        value=current_date,
-                        format="DD/MM/YYYY",
-                        key=f"date_{idx}"
-                    )
-                )
+                        st.warning(
+                            f"**"
+                            f"{finding['type']}"
+                            f"**\n\n"
+                            f"{finding['description']}"
+                        )
 
-                expense[
-                    "date"
-                ] = (
-                    selected
-                    .strftime(
-                        "%d-%m-%Y"
-                    )
-                )
+                if expense.get(
+                    "explanation"
+                ):
 
+                    st.subheader(
+                        "Explanation"
+                    )
+
+                    st.write(
+                        expense[
+                            "explanation"
+                        ]
+                    )
+
+        # -----------------------------------------
+        # Sync widgets back to expense
+        # -----------------------------------------
+        expense[
+            "category"
+        ] = st.session_state[
+            category_key
+        ]
+
+        expense[
+            "vendor"
+        ] = st.session_state[
+            vendor_key
+        ]
+
+        expense[
+            "amount"
+        ] = st.session_state[
+            amount_key
+        ]
+
+        expense[
+            "date"
+        ] = (
+            st.session_state[
+                date_key
+            ]
+            .strftime(
+                "%d-%m-%Y"
+            )
+        )
+
+        expense[
+            "other_category"
+        ] = st.session_state[
+            other_key
+        ]
+
+    # -----------------------------------------
+    # Delete
+    # -----------------------------------------
     if delete_index is not None:
 
-        st.session_state.expenses.pop(
-            delete_index
+        deleted = (
+            st.session_state
+            .expenses[
+                delete_index
+            ]
         )
 
-        st.rerun()
-
-    st.markdown("")
-
-    if st.button(
-        "➕ Add Expense Item"
-    ):
-
-        st.session_state.expenses.append(
-            {
-                "receipt_name":
-                    "Manual Entry",
-                "category":
-                    "Hotel",
-                "vendor":
-                    "",
-                "amount":
-                    0.0,
-                "date":
-                    date.today()
-                    .strftime(
-                        "%d-%m-%Y"
-                    ),
-                "other_category":
-                    ""
-            }
+        receipt_id = (
+            deleted.get(
+                "receipt_id",
+                ""
+            )
         )
+
+        for key in [
+            f"cat_{receipt_id}",
+            f"vendor_{receipt_id}",
+            f"amount_{receipt_id}",
+            f"date_{receipt_id}",
+            f"other_{receipt_id}"
+        ]:
+
+            if key in st.session_state:
+                del st.session_state[
+                    key
+                ]
+
+        st.session_state\
+            .expenses.pop(
+                delete_index
+            )
 
         st.rerun()
 
