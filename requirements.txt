@@ -1,6 +1,6 @@
 streamlit
 requests
-dotenv
+python-dotenv
 paddleocr
 paddlepaddle
 fastapi
@@ -9,5 +9,13 @@ langchain
 langchain-core
 langchain-community
 langchain-ollama
+langchain-openai
+langchain-chroma
+langchain-text-splitters
+langgraph
+chromadb
 pydantic
 python-dateutil
+unstructured
+unstructured[md]
+typing-extensions

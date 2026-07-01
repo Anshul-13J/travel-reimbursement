@@ -113,6 +113,18 @@ def validate_claim(employee_id, expenses):
 if "expenses" not in st.session_state:
     st.session_state.expenses = []
 
+# Workflow state — persists across reruns during clarification loop
+if "claim_id" not in st.session_state:
+    st.session_state.claim_id = None
+if "workflow_status" not in st.session_state:
+    st.session_state.workflow_status = None   # None | "clarification_needed" | "decided"
+if "workflow_questions" not in st.session_state:
+    st.session_state.workflow_questions = []
+if "workflow_decision" not in st.session_state:
+    st.session_state.workflow_decision = None
+if "workflow_audit" not in st.session_state:
+    st.session_state.workflow_audit = []
+
 # ==================================================
 # TITLE
 # ==================================================
@@ -580,66 +592,210 @@ with right:
         st.rerun()
 
 # ==================================================
-# SUBMIT
+# SUBMIT + WORKFLOW
 # ==================================================
 st.markdown("---")
 
-_, _, submit = st.columns(
-    [5, 1, 1]
-)
+# --------------------------------------------------
+# Travel type selector (above submit)
+# --------------------------------------------------
+_, travel_col, submit_col = st.columns([4, 2, 1])
 
-with submit:
+with travel_col:
+    travel_type = st.selectbox(
+        "Travel Type",
+        ["Domestic", "International"],
+        key="travel_type_select",
+    )
 
-    if st.button(
+with submit_col:
+    submit_clicked = st.button(
         "Submit Claim",
         type="primary",
-        use_container_width=True
-    ):
+        use_container_width=True,
+    )
 
-        errors = validate_claim(
-            employee_id,
-            st.session_state
-            .expenses
-        )
+if submit_clicked:
+    errors = validate_claim(
+        employee_id,
+        st.session_state.expenses,
+    )
 
-        if errors:
-
-            st.error(
-                "Please fix the following:"
-            )
-
-            for e in errors:
-                st.write(
-                    f"• {e}"
-                )
-
-        else:
-
-            payload = {
-                "employee_id":
-                    employee_id,
-                "expenses":
-                    st.session_state
-                    .expenses
-            }
-
-            try:
-
-                response = requests.post(
+    if errors:
+        st.error("Please fix the following:")
+        for e in errors:
+            st.write(f"• {e}")
+    else:
+        payload = {
+            "employee_id": employee_id,
+            "travel_type": travel_type,
+            "expenses": st.session_state.expenses,
+        }
+        try:
+            with st.spinner("Processing claim..."):
+                resp = requests.post(
                     f"{BACKEND_URL}/submit",
-                    json=payload
+                    json=payload,
+                    timeout=120,
+                )
+            resp.raise_for_status()
+            data = resp.json()
+
+            st.session_state.claim_id = data["claim_id"]
+            st.session_state.workflow_status = data["status"]
+            st.session_state.workflow_audit = data.get("audit_trail", [])
+
+            if data["status"] == "clarification_needed":
+                st.session_state.workflow_questions = data.get("questions", [])
+                st.session_state.workflow_decision = None
+            else:
+                st.session_state.workflow_questions = []
+                st.session_state.workflow_decision = data.get("decision")
+
+            st.rerun()
+
+        except Exception as e:
+            st.error(f"Submission failed: {e}")
+
+# --------------------------------------------------
+# Audit trail (always shown when available)
+# --------------------------------------------------
+if st.session_state.workflow_audit:
+    with st.expander("Workflow steps / audit trail", expanded=False):
+        for step in st.session_state.workflow_audit:
+            label = step.get("step", "step")
+            ts = step.get("ts", "")
+            detail = {k: v for k, v in step.items() if k not in ("step", "ts")}
+            st.markdown(f"**{label}** `{ts}`")
+            if detail:
+                st.json(detail)
+
+# --------------------------------------------------
+# Clarification form
+# --------------------------------------------------
+if st.session_state.workflow_status == "clarification_needed":
+    questions = st.session_state.workflow_questions
+    st.warning(
+        f"**Clarification required** — "
+        f"please answer {len(questions)} question(s) before a decision can be made."
+    )
+
+    with st.form("clarification_form"):
+        answers = {}
+        for q in questions:
+            q_id = q["id"]
+            q_text = q["question"]
+            exp_idx = q.get("expense_idx")
+            label = q_text
+            if exp_idx is not None:
+                label = f"*Expense #{exp_idx + 1}* — {q_text}"
+
+            if q.get("type") == "yes_no":
+                answers[q_id] = st.radio(
+                    label,
+                    ["Yes", "No"],
+                    key=f"clar_{q_id}",
+                )
+            else:
+                answers[q_id] = st.text_area(
+                    label,
+                    key=f"clar_{q_id}",
                 )
 
-                st.success(
-                    "Claim submitted"
+        submitted = st.form_submit_button("Submit Answers")
+
+    if submitted:
+        try:
+            with st.spinner("Getting decision..."):
+                resp = requests.post(
+                    f"{BACKEND_URL}/claims/"
+                    f"{st.session_state.claim_id}/answers",
+                    json={"answers": answers},
+                    timeout=120,
+                )
+            resp.raise_for_status()
+            data = resp.json()
+
+            st.session_state.workflow_status = data["status"]
+            st.session_state.workflow_decision = data.get("decision")
+            st.session_state.workflow_audit = data.get("audit_trail", [])
+            st.session_state.workflow_questions = []
+            st.rerun()
+
+        except Exception as e:
+            st.error(f"Failed to submit answers: {e}")
+
+# --------------------------------------------------
+# Decision display
+# --------------------------------------------------
+if st.session_state.workflow_status == "decided" and st.session_state.workflow_decision:
+    dec = st.session_state.workflow_decision
+    verdict = dec.get("decision", "")
+
+    # Colour-coded banner
+    colour_map = {
+        "APPROVED": "success",
+        "PARTIAL": "warning",
+        "REJECTED": "error",
+        "MANUAL_REVIEW": "info",
+    }
+    banner_fn = getattr(st, colour_map.get(verdict, "info"))
+    banner_fn(f"### Decision: {verdict}")
+
+    # Summary metrics
+    m1, m2, m3 = st.columns(3)
+    m1.metric(
+        "Approved",
+        f"₹ {dec.get('approved_amount', 0):,.2f}",
+    )
+    m2.metric(
+        "Rejected",
+        f"₹ {dec.get('rejected_amount', 0):,.2f}",
+    )
+    approval_level = dec.get("approval_level", "auto")
+    m3.metric("Approval Level", approval_level.upper())
+
+    # Explanation
+    if dec.get("explanation"):
+        st.markdown("**Explanation**")
+        st.write(dec["explanation"])
+
+    # Policy references
+    if dec.get("policy_references"):
+        st.markdown("**Policy References**")
+        st.write("  •  ".join(dec["policy_references"]))
+
+    # Line-item breakdown
+    line_items = dec.get("line_items", [])
+    if line_items:
+        with st.expander("Line-item breakdown", expanded=True):
+            expenses_list = st.session_state.expenses
+            for item in line_items:
+                idx = item.get("expense_idx", 0)
+                exp = (
+                    expenses_list[idx]
+                    if idx < len(expenses_list)
+                    else {}
+                )
+                item_verdict = item.get("decision", "")
+                item_colour = colour_map.get(item_verdict, "info")
+                item_fn = getattr(st, item_colour)
+                item_fn(
+                    f"**{exp.get('vendor', f'Expense #{idx+1}')}** "
+                    f"({exp.get('category', '')}) — "
+                    f"{item_verdict}: "
+                    f"approved ₹{item.get('approved_amount', 0):,.2f}, "
+                    f"rejected ₹{item.get('rejected_amount', 0):,.2f}. "
+                    f"_{item.get('reason', '')}_"
                 )
 
-                st.json(
-                    response.json()
-                )
-
-            except Exception as e:
-
-                st.error(
-                    str(e)
-                )
+    # Reset button
+    st.markdown("---")
+    if st.button("Start new claim"):
+        for key in [
+            "claim_id", "workflow_status", "workflow_questions",
+            "workflow_decision", "workflow_audit", "expenses",
+        ]:
+            if key in st.session_state:
+                del st.session_state[key]
+        st.rerun()
