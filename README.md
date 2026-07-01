@@ -22,7 +22,7 @@ LangGraph Workflow  (agent/workflow.py)
   │    - approval_checker               │
   │ 4. detect_clarification_need        │
   │ 5. generate_clarification_questions │  ← stops here if needed
-  │ 6. decision_agent (Grok LLM)        │
+  │ 6. decision_agent (Groq LLM)        │
   │ 7. validate_decision_output         │
   └─────────────────────────────────────┘
         │
@@ -72,7 +72,7 @@ streamlit run frontend/streamlit_app.py
 | Method | Path | Description |
 |---|---|---|
 | GET | `/health` | Health check |
-| GET | `/grok/health` | Grok LLM connectivity check |
+| GET | `/groq/health` | Groq LLM connectivity check |
 | POST | `/ocr` | Extract and parse a receipt image |
 | POST | `/submit` | Submit a claim for processing |
 | POST | `/claims/{id}/answers` | Submit clarification answers |
@@ -84,7 +84,7 @@ streamlit run frontend/streamlit_app.py
 |---|---|---|
 | OCR parsing | gemma3:4b | Ollama (local) |
 | Policy embeddings | nomic-embed-text | Ollama (local) |
-| Decision making | grok-3-mini | xAI Grok API |
+| Decision making | llama-3.3-70b-versatile | Groq API |
 
 ## Policy retrieval
 

@@ -7,11 +7,8 @@ from llm.models import structured_llm
 class ReceiptParser:
 
     def __init__(self):
-        self.prompt = (
-            Path(
-                "extraction/prompt.md"
-            ).read_text()
-        )
+        prompt_path = Path(__file__).parent / "prompt.md"
+        self.prompt = prompt_path.read_text()
 
     def parse(
         self,

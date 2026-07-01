@@ -48,6 +48,15 @@ Alcohol:
 - Rum
 - Cocktail
 
+Non-alcoholic beverages:
+- Water
+- Lassi
+- Juice
+- Tea
+- Coffee
+- Soda
+- Lemonade
+
 Multiple attendees:
 - Many dishes
 - Large quantities

@@ -230,8 +230,6 @@ with left:
                                 f"{file.name}"
                             )
                             receipt = response.json()
-                            print(response)
-                            print(receipt)
                             parsed.append(
                                 {
                                     "receipt_id": receipt["receipt_id"],

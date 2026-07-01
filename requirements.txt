@@ -10,6 +10,7 @@ langchain-core
 langchain-community
 langchain-ollama
 langchain-openai
+langchain-groq
 langchain-chroma
 langchain-text-splitters
 langgraph

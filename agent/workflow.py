@@ -2,16 +2,13 @@
 Compact LangGraph workflow for travel reimbursement claim processing.
 
 Nodes:
-  1. normalize_claim            - clean and enrich the raw claim
-  2. retrieve_policy_context    - ChromaDB policy lookup
-  3. run_rule_checks             - deterministic tool checks
-  4. detect_clarification_need  - decide if questions are needed
-  5. generate_clarification_questions  - LLM-assisted question generation
-  6. decision_agent             - Grok LLM final decision
-  7. validate_decision_output   - structural output check
-
-The workflow stops at END after step 5 when clarification is needed.
-The /claims/{claim_id}/answers endpoint resumes from step 6.
+  1. normalize_claim                 - clean and enrich the raw claim
+  2. retrieve_policy_context         - ChromaDB policy lookup
+  3. run_rule_checks                 - deterministic evidence collection
+  4. detect_clarification_need       - LLM triage for missing information
+  5. generate_clarification_questions - LLM-generated follow-up questions
+  6. decision_agent                  - Groq-powered final decision
+  7. validate_decision_output        - schema validation and repair
 """
 
 import json
@@ -20,27 +17,21 @@ import sys
 from datetime import date, datetime
 from pathlib import Path
 
-# Ensure project root is on path for tools/ and rag/ imports
+# Ensure project root and backend root are on path for imports
 ROOT = Path(__file__).parent.parent
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
+BACKEND_ROOT = ROOT / "backend"
+for path in (ROOT, BACKEND_ROOT):
+    path_str = str(path)
+    if path_str not in sys.path:
+        sys.path.insert(0, path_str)
 
 from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.graph import END, StateGraph
 
 from agent.models import ClaimState
-from tools.approval_checker import check_approval_threshold
-from tools.duplicate_detector import detect_duplicates
-from tools.limit_checker import check_limits
+from llm.groq_client import get_groq_llm
 from tools.output_validator import validate_output
 from tools.policy_lookup import lookup_policy
-from tools.receipt_validator import validate_receipts
-
-# Non-reimbursable keywords (matches category name or OCR finding type)
-_NON_REIMB_KEYWORDS = {
-    "alcohol", "entertainment", "movie", "shopping",
-    "sightseeing", "spa", "fine", "gift",
-}
 
 
 # ---------------------------------------------------------------------------
@@ -72,439 +63,30 @@ def _parse_json(text: str) -> dict | None:
     return None
 
 
-# ---------------------------------------------------------------------------
-# Node 1 – normalize_claim
-# ---------------------------------------------------------------------------
-
-def normalize_claim(state: ClaimState) -> ClaimState:
-    claim = state["claim"]
-    expenses = claim.get("expenses", [])
-    today = date.today()
-
-    normalized_expenses = []
-    for exp in expenses:
-        e = dict(exp)
-        e["amount"] = float(e.get("amount", 0))
-        e["category"] = str(e.get("category", "Others")).strip().title()
-        normalized_expenses.append(e)
-
-    # Submission delay = days since oldest expense date
-    submission_days = 0
-    for exp in normalized_expenses:
-        try:
-            exp_date = datetime.strptime(
-                exp.get("date", ""), "%d-%m-%Y"
-            ).date()
-            days = (today - exp_date).days
-            if days > submission_days:
-                submission_days = days
-        except Exception:
-            pass
-
-    normalized = {
-        "employee_id": claim.get("employee_id", ""),
-        "travel_type": claim.get("travel_type", "Domestic"),
-        "submission_days": submission_days,
-        "expenses": normalized_expenses,
-        "total_amount": round(sum(e["amount"] for e in normalized_expenses), 2),
-    }
-
-    trail = _add_audit(state, "normalize_claim", {
-        "expense_count": len(normalized_expenses),
-        "total_amount": normalized["total_amount"],
-        "submission_days": submission_days,
-    })
-
-    return {**state, "normalized": normalized, "audit_trail": trail}
-
-
-# ---------------------------------------------------------------------------
-# Node 2 – retrieve_policy_context
-# ---------------------------------------------------------------------------
-
-def retrieve_policy_context(state: ClaimState) -> ClaimState:
-    normalized = state["normalized"]
-    expenses = normalized.get("expenses", [])
-    travel_type = normalized.get("travel_type", "Domestic")
-
-    categories = list({e["category"] for e in expenses})
-    context = []
-    source = "none"
-
+def _invoke_llm_json(system_prompt: str, user_message: str, step: str = "llm") -> dict:
+    """Invoke LLM with retry logic. Raises on failure - no silent fallback."""
+    from llm.groq_client import invoke_with_retry
     try:
-        seen_hashes = set()
-        for cat in categories:
-            chunks = lookup_policy(cat, f"{travel_type} travel")
-            for chunk in chunks:
-                h = hash(chunk[:120])
-                if h not in seen_hashes:
-                    seen_hashes.add(h)
-                    context.append(chunk)
-        context = context[:10]
-        source = "chromadb" if context else "fallback"
-    except Exception:
-        pass
-
-    trail = _add_audit(state, "retrieve_policy_context", {
-        "categories": categories,
-        "chunks": len(context),
-        "source": source,
-    })
-
-    return {**state, "policy_context": context, "audit_trail": trail}
-
-
-# ---------------------------------------------------------------------------
-# Node 3 – run_rule_checks
-# ---------------------------------------------------------------------------
-
-def run_rule_checks(state: ClaimState) -> ClaimState:
-    normalized = state["normalized"]
-    expenses = normalized.get("expenses", [])
-    travel_type = normalized.get("travel_type", "Domestic")
-    submission_days = normalized.get("submission_days", 0)
-    total = normalized.get("total_amount", 0)
-
-    receipt_result = validate_receipts(expenses)
-    duplicate_result = detect_duplicates(expenses)
-    limit_result = check_limits(expenses, travel_type)
-    approval_result = check_approval_threshold(total, travel_type)
-
-    # Late submission rule
-    late_submission = None
-    if submission_days > 30:
-        late_submission = {
-            "type": "HARD_LATE",
-            "days": submission_days,
-            "outcome": "REJECT",
-        }
-    elif submission_days > 15:
-        late_submission = {
-            "type": "SOFT_LATE",
-            "days": submission_days,
-            "outcome": "MANUAL_REVIEW",
-        }
-
-    # Non-reimbursable detection (category name or OCR findings)
-    non_reimbursable = []
-    for idx, exp in enumerate(expenses):
-        cat_lower = exp.get("category", "").lower()
-        findings = exp.get("findings", [])
-        has_alcohol = any(
-            isinstance(f, dict)
-            and "alcohol" in f.get("type", "").lower()
-            for f in findings
-        )
-        if any(kw in cat_lower for kw in _NON_REIMB_KEYWORDS):
-            non_reimbursable.append({
-                "expense_idx": idx,
-                "reason": f"Category '{exp['category']}' is non-reimbursable",
-            })
-        elif has_alcohol:
-            non_reimbursable.append({
-                "expense_idx": idx,
-                "reason": "Alcohol detected in receipt",
-            })
-
-    rule_results = {
-        "receipt_validation": receipt_result,
-        "duplicate_detection": duplicate_result,
-        "limit_checks": limit_result,
-        "approval_threshold": approval_result,
-        "late_submission": late_submission,
-        "non_reimbursable": non_reimbursable,
-    }
-
-    trail = _add_audit(state, "run_rule_checks", {
-        "receipt_issues": len(receipt_result["issues"]),
-        "duplicates": len(duplicate_result["duplicates"]),
-        "cap_violations": len(limit_result["partial_approvals"]),
-        "non_reimbursable": len(non_reimbursable),
-        "approval_level": approval_result["approval_level"],
-        "late_submission": late_submission["type"] if late_submission else None,
-    })
-
-    return {**state, "rule_results": rule_results, "audit_trail": trail}
-
-
-# ---------------------------------------------------------------------------
-# Node 4 – detect_clarification_need
-# ---------------------------------------------------------------------------
-
-def detect_clarification_need(state: ClaimState) -> ClaimState:
-    rule_results = state.get("rule_results", {})
-    normalized = state.get("normalized", {})
-    needs = False
-    reasons = []
-
-    # Hard reject — no clarification needed
-    late = rule_results.get("late_submission")
-    if late and late["outcome"] == "REJECT":
-        trail = _add_audit(state, "detect_clarification_need", {
-            "needs_clarification": False,
-            "reason": "Hard reject: late submission",
-        })
-        return {**state, "needs_clarification": False, "audit_trail": trail}
-
-    if late and late["outcome"] == "MANUAL_REVIEW":
-        needs = True
-        reasons.append("Late submission — manager justification required")
-
-    if rule_results.get("receipt_validation", {}).get("issues"):
-        needs = True
-        reasons.append("Missing receipts")
-
-    if rule_results.get("duplicate_detection", {}).get("has_duplicates"):
-        needs = True
-        reasons.append("Possible duplicate expenses")
-
-    if rule_results.get("non_reimbursable"):
-        needs = True
-        reasons.append("Non-reimbursable items detected")
-
-    for exp in normalized.get("expenses", []):
-        if float(exp.get("confidence", 1.0)) < 0.70:
-            needs = True
-            reasons.append("Low OCR confidence on one or more receipts")
-            break
-
-    trail = _add_audit(state, "detect_clarification_need", {
-        "needs_clarification": needs,
-        "reasons": reasons,
-    })
-
-    return {**state, "needs_clarification": needs, "audit_trail": trail}
-
-
-# ---------------------------------------------------------------------------
-# Node 5 – generate_clarification_questions
-# ---------------------------------------------------------------------------
-
-def generate_clarification_questions(state: ClaimState) -> ClaimState:
-    rule_results = state.get("rule_results", {})
-    normalized = state.get("normalized", {})
-    expenses = normalized.get("expenses", [])
-    questions = []
-    q_id = 0
-
-    for issue in rule_results.get("receipt_validation", {}).get("issues", []):
-        idx = issue["expense_idx"]
-        exp = expenses[idx] if idx < len(expenses) else {}
-        questions.append({
-            "id": f"q{q_id}",
-            "expense_idx": idx,
-            "question": (
-                f"Receipt missing for {exp.get('vendor', f'Expense #{idx+1}')} "
-                f"({exp.get('category')}). Please confirm or provide documentation."
-            ),
-            "type": "text",
-        })
-        q_id += 1
-
-    for dup in rule_results.get("duplicate_detection", {}).get("duplicates", []):
-        idx = dup["expense_idx"]
-        exp = expenses[idx] if idx < len(expenses) else {}
-        questions.append({
-            "id": f"q{q_id}",
-            "expense_idx": idx,
-            "question": (
-                f"{exp.get('vendor', f'Expense #{idx+1}')} looks like a duplicate. "
-                f"Is this a separate transaction?"
-            ),
-            "type": "yes_no",
-        })
-        q_id += 1
-
-    for item in rule_results.get("non_reimbursable", []):
-        idx = item["expense_idx"]
-        exp = expenses[idx] if idx < len(expenses) else {}
-        questions.append({
-            "id": f"q{q_id}",
-            "expense_idx": idx,
-            "question": (
-                f"{item['reason']} ({exp.get('vendor', f'Expense #{idx+1}')}). "
-                f"Was this for an approved client event with prior manager approval?"
-            ),
-            "type": "yes_no",
-        })
-        q_id += 1
-
-    late = rule_results.get("late_submission")
-    if late and late.get("outcome") == "MANUAL_REVIEW":
-        questions.append({
-            "id": f"q{q_id}",
-            "expense_idx": None,
-            "question": (
-                f"Claim submitted {late['days']} days after travel "
-                f"(policy limit: 15 days for auto, 30 days hard limit). "
-                f"Please provide the reason for late submission."
-            ),
-            "type": "text",
-        })
-        q_id += 1
-
-    for idx, exp in enumerate(expenses):
-        if float(exp.get("confidence", 1.0)) < 0.70:
-            questions.append({
-                "id": f"q{q_id}",
-                "expense_idx": idx,
-                "question": (
-                    f"OCR confidence is low for receipt from "
-                    f"{exp.get('vendor', 'unknown vendor')}. "
-                    f"Please confirm: amount = {exp.get('amount')}, "
-                    f"date = {exp.get('date')}."
-                ),
-                "type": "text",
-            })
-            q_id += 1
-
-    trail = _add_audit(state, "generate_clarification_questions", {
-        "question_count": len(questions),
-    })
-
-    return {
-        **state,
-        "clarification_questions": questions,
-        "audit_trail": trail,
-    }
-
-
-# ---------------------------------------------------------------------------
-# Node 6 – decision_agent
-# ---------------------------------------------------------------------------
-
-def decision_agent(state: ClaimState) -> ClaimState:
-    normalized = state.get("normalized", {})
-    rule_results = state.get("rule_results", {})
-    policy_context = state.get("policy_context", [])
-    clarification_questions = state.get("clarification_questions", [])
-    clarification_answers = state.get("clarification_answers", {})
-
-    expenses = normalized.get("expenses", [])
-
-    # Hard reject bypass — no need to call LLM
-    late = rule_results.get("late_submission")
-    if late and late.get("outcome") == "REJECT":
-        total = normalized.get("total_amount", 0.0)
-        decision = {
-            "decision": "REJECTED",
-            "approved_amount": 0.0,
-            "rejected_amount": total,
-            "explanation": (
-                f"Claim rejected: submitted {late['days']} days after travel, "
-                f"exceeding the 30-day hard limit."
-            ),
-            "policy_references": ["REJECT_LATE_SUBMISSION"],
-            "line_items": [
-                {
-                    "expense_idx": i,
-                    "decision": "REJECTED",
-                    "reason": "Late submission",
-                    "approved_amount": 0,
-                    "rejected_amount": expenses[i]["amount"],
-                }
-                for i in range(len(expenses))
-            ],
-            "approval_level": rule_results.get("approval_threshold", {}).get(
-                "approval_level", "auto"
-            ),
-        }
-        trail = _add_audit(state, "decision_agent", {
-            "source": "deterministic",
-            "decision": "REJECTED",
-        })
-        return {**state, "decision": decision, "audit_trail": trail}
-
-    # Build expense summaries with pre-computed rule flags
-    cap_map = {
-        item["expense_idx"]: item
-        for item in rule_results.get("limit_checks", {}).get("partial_approvals", [])
-    }
-    non_reimb_set = {
-        item["expense_idx"]
-        for item in rule_results.get("non_reimbursable", [])
-    }
-
-    expense_summaries = []
-    for idx, exp in enumerate(expenses):
-        s = {k: v for k, v in exp.items() if k != "findings"}
-        if idx in non_reimb_set:
-            s["rule_flag"] = "NON_REIMBURSABLE"
-        elif idx in cap_map:
-            s["rule_flag"] = "CAP_APPLIED"
-            s["cap_approved"] = cap_map[idx]["approved"]
-        expense_summaries.append(s)
-
-    # Build clarification Q&A block
-    qa_lines = []
-    for q in clarification_questions:
-        answer = clarification_answers.get(q["id"], "No answer provided")
-        qa_lines.append(f"Q: {q['question']}\nA: {answer}")
-    qa_section = "\n\n".join(qa_lines) if qa_lines else "None"
-
-    policy_text = (
-        "\n\n---\n\n".join(policy_context[:6])
-        if policy_context
-        else "No specific policy context available."
-    )
-
-    # Load prompts
-    prompt_dir = ROOT / "agent" / "prompts"
-    system_prompt = (prompt_dir / "system_prompt.md").read_text(encoding="utf-8")
-    decision_template = (prompt_dir / "decision_prompt.md").read_text(encoding="utf-8")
-
-    user_message = decision_template.format(
-        employee_id=normalized.get("employee_id", ""),
-        travel_type=normalized.get("travel_type", "Domestic"),
-        total_amount=normalized.get("total_amount", 0),
-        approval_label=rule_results.get("approval_threshold", {}).get(
-            "approval_label", ""
-        ),
-        expenses=json.dumps(expense_summaries, indent=2, default=str),
-        rule_results=json.dumps(
-            {k: v for k, v in rule_results.items() if k != "limit_checks"},
-            indent=2,
-            default=str,
-        ),
-        policy_context=policy_text,
-        qa_section=qa_section,
-    )
-
-    decision_data = None
-    source = "deterministic"
-
-    try:
-        from llm.grok_client import get_grok_llm
-
-        llm = get_grok_llm()
-        response = llm.invoke([
+        print(f"[workflow] Calling Groq for {step}")
+        llm = get_groq_llm()
+        response = invoke_with_retry(llm, [
             SystemMessage(content=system_prompt),
             HumanMessage(content=user_message),
-        ])
+        ], step_name=step)
         text = getattr(response, "content", str(response))
         parsed = _parse_json(text)
-        if parsed:
-            decision_data = _normalize_decision(parsed, normalized)
-            source = "grok"
-    except Exception:
-        pass
-
-    if not decision_data:
-        decision_data = _fallback_decision(normalized, rule_results)
-
-    trail = _add_audit(state, "decision_agent", {
-        "source": source,
-        "decision": decision_data.get("decision"),
-        "approved_amount": decision_data.get("approved_amount"),
-    })
-
-    return {**state, "decision": decision_data, "audit_trail": trail}
+        if not parsed:
+            raise ValueError(f"Failed to parse JSON from LLM response for {step}")
+        return parsed
+    except Exception as exc:
+        print(f"[workflow] ❌ CRITICAL: Groq failed for {step}: {exc}")
+        raise  # Explicitly raise instead of silent fallback
 
 
 def _normalize_decision(parsed: dict, normalized: dict) -> dict:
-    total = normalized.get("total_amount", 0)
-    approved = float(parsed.get("approved_amount", total))
-    rejected = float(parsed.get("rejected_amount", max(0, total - approved)))
+    total = float(normalized.get("total_amount", 0) or 0)
+    approved = float(parsed.get("approved_amount", total) or total)
+    rejected = float(parsed.get("rejected_amount", max(0.0, total - approved)) or 0.0)
 
     decision_map = {
         "APPROVE": "APPROVED",
@@ -531,77 +113,370 @@ def _normalize_decision(parsed: dict, normalized: dict) -> dict:
     }
 
 
-def _fallback_decision(normalized: dict, rule_results: dict) -> dict:
-    """Pure rule-based fallback when Grok is unavailable."""
-    expenses = normalized.get("expenses", [])
-    cap_map = {
-        item["expense_idx"]: item
-        for item in rule_results.get("limit_checks", {}).get("partial_approvals", [])
-    }
-    non_reimb_set = {
-        item["expense_idx"]
-        for item in rule_results.get("non_reimbursable", [])
+# ---------------------------------------------------------------------------
+# Node 1 – normalize_claim
+# ---------------------------------------------------------------------------
+
+def normalize_claim(state: ClaimState) -> ClaimState:
+    claim = state["claim"]
+    expenses = claim.get("expenses", [])
+    today = date.today()
+
+    normalized_expenses = []
+    expense_submission_days = []
+    for idx, exp in enumerate(expenses):
+        item = dict(exp)
+        item["expense_idx"] = idx
+        item["amount"] = float(item.get("amount", 0) or 0)
+        item["category"] = str(item.get("category", "Others")).strip().title()
+        item["raw_text"] = str(item.get("raw_text", "")).strip()
+        item["is_old_expense"] = False
+        item["rejection_reason"] = None
+        try:
+            exp_date = datetime.strptime(str(item.get("date", "")), "%d-%m-%Y").date()
+            days_since = (today - exp_date).days
+            item["days_since_expense"] = days_since
+            expense_submission_days.append(days_since)
+            if days_since > 365:
+                item["is_old_expense"] = True
+                item["rejection_reason"] = "Expense date is older than 365 days; reimbursement is not allowed."
+        except Exception:
+            item["days_since_expense"] = None
+            expense_submission_days.append(None)
+        normalized_expenses.append(item)
+
+    submission_days = max([d for d in expense_submission_days if d is not None], default=0)
+
+    normalized = {
+        "employee_id": claim.get("employee_id", ""),
+        "travel_type": claim.get("travel_type", "Domestic"),
+        "submission_days": submission_days,
+        "expense_age_days": expense_submission_days,
+        "expenses": normalized_expenses,
+        "total_amount": round(sum(item["amount"] for item in normalized_expenses), 2),
     }
 
-    approved = 0.0
-    rejected = 0.0
-    line_items = []
-    policy_refs = []
+    trail = _add_audit(state, "normalize_claim", {
+        "expense_count": len(normalized_expenses),
+        "total_amount": normalized["total_amount"],
+        "submission_days": submission_days,
+        "old_expenses": [idx for idx, exp in enumerate(normalized_expenses) if exp.get("is_old_expense")],
+    })
+
+    return {**state, "normalized": normalized, "audit_trail": trail}
+
+
+# ---------------------------------------------------------------------------
+# Node 2 – retrieve_policy_context
+# ---------------------------------------------------------------------------
+
+def retrieve_policy_context(state: ClaimState) -> ClaimState:
+    normalized = state["normalized"]
+    expenses = normalized.get("expenses", [])
+    travel_type = normalized.get("travel_type", "Domestic")
+
+    context = []
+    try:
+        seen_hashes = set()
+        for idx, expense in enumerate(expenses):
+            category = str(expense.get("category", "")).strip()
+        vendor = str(expense.get("vendor", "")).strip()
+        amount = expense.get("amount", 0)
+        date_text = str(expense.get("date", "")).strip()
+        raw_text = str(expense.get("raw_text", "")).strip()
+
+        query_parts = [travel_type, category, "expense", vendor, f"amount {amount}", date_text]
+        if raw_text:
+            query_parts.append(raw_text[:250])
+        query = " ".join([p for p in query_parts if p]).strip()
+
+        chunks = lookup_policy(category, query)
+        if not chunks and raw_text:
+            fallback_query = f"{category} {travel_type} {vendor} {date_text} {raw_text[:200]}".strip()
+            chunks = lookup_policy(category, fallback_query)
+
+        for chunk in chunks:
+            chunk_key = hash((category, vendor, chunk[:120]))
+            if chunk_key not in seen_hashes:
+                seen_hashes.add(chunk_key)
+                context.append({
+                    "expense_idx": idx,
+                    "query": query,
+                    "chunk": chunk,
+                })
+        context = context[:12]
+    except Exception:
+        pass
+
+    trail = _add_audit(state, "retrieve_policy_context", {
+        "expense_count": len(expenses),
+        "chunks": len(context),
+        "source": "chromadb" if context else "fallback",
+    })
+
+    return {**state, "policy_context": context, "audit_trail": trail}
+
+
+# ---------------------------------------------------------------------------
+# Node 3 – run_rule_checks
+# ---------------------------------------------------------------------------
+
+def run_rule_checks(state: ClaimState) -> ClaimState:
+    normalized = state["normalized"]
+    expenses = normalized.get("expenses", [])
+    travel_type = normalized.get("travel_type", "Domestic")
+
+    today = date.today()
+    normalized_expenses = []
+    ALCOHOL_KEYWORDS = {
+        "beer", "wine", "whiskey", "vodka", "tequila", "rum", "cocktail",
+        "mojito", "long island", "brandy", "gin", "margarita", "scotch",
+    }
+    NON_ALCOHOL_KEYWORDS = {
+        "water", "lassi", "juice", "milk", "coffee", "tea", "soda", "cola",
+        "lemonade", "ginger ale", "mineral water", "soft drink",
+    }
+    MULTI_ATTENDEES_KEYWORDS = {
+        "people", "guests", "pax", "serves", "plates", "persons", "group",
+        "team", "clients", "colleagues", "attendees", "meeting",
+    }
 
     for idx, exp in enumerate(expenses):
-        amount = exp["amount"]
-        if idx in non_reimb_set:
-            rejected += amount
-            line_items.append({
-                "expense_idx": idx,
-                "decision": "REJECTED",
-                "reason": "Non-reimbursable",
-                "approved_amount": 0,
-                "rejected_amount": amount,
-            })
-            policy_refs.append("REJECT_NON_REIMBURSABLE")
-        elif idx in cap_map:
-            cap = cap_map[idx]
-            approved += cap["approved"]
-            rejected += cap["rejected"]
-            line_items.append({
-                "expense_idx": idx,
-                "decision": "PARTIAL",
-                "reason": cap["message"],
-                "approved_amount": cap["approved"],
-                "rejected_amount": cap["rejected"],
-            })
-            policy_refs.append("PARTIAL_CAP_APPLIED")
-        else:
-            approved += amount
-            line_items.append({
-                "expense_idx": idx,
-                "decision": "APPROVED",
-                "reason": "Within policy limits",
-                "approved_amount": amount,
-                "rejected_amount": 0,
-            })
-            policy_refs.append("APPROVED_WITHIN_LIMIT")
+        item = dict(exp)
+        item["expense_idx"] = idx
+        item["travel_type"] = travel_type
+        item["submission_days"] = normalized.get("submission_days", 0)
+        try:
+            exp_date = datetime.strptime(str(item.get("date", "")), "%d-%m-%Y").date()
+            item["days_since_expense"] = (today - exp_date).days
+        except Exception:
+            item["days_since_expense"] = None
 
-    total = normalized.get("total_amount", 0)
-    if rejected >= total:
-        decision = "REJECTED"
-    elif rejected > 0:
-        decision = "PARTIAL"
-    else:
-        decision = "APPROVED"
+        text = " ".join([
+            str(item.get("vendor", "")),
+            str(item.get("category", "")),
+            str(item.get("findings", "")),
+            str(item.get("raw_text", "")),
+        ]).lower()
+
+        contains_alcohol = any(keyword in text for keyword in ALCOHOL_KEYWORDS)
+        contains_non_alcohol = any(keyword in text for keyword in NON_ALCOHOL_KEYWORDS)
+        item["alcohol_detected"] = contains_alcohol and not contains_non_alcohol
+        item["alcohol_note"] = (
+            "Non-alcoholic beverage confirmed by receipt text." if contains_non_alcohol else
+            "Alcohol-related terms detected in receipt text." if contains_alcohol else
+            "No alcohol indicators found."
+        )
+        item["multiple_attendees"] = any(keyword in text for keyword in MULTI_ATTENDEES_KEYWORDS)
+        item["expense_text_snippet"] = text[:250]
+        normalized_expenses.append(item)
+
+    rule_results = {
+        "expenses": normalized_expenses,
+        "evidence_summary": {
+            "expense_count": len(normalized_expenses),
+            "travel_type": travel_type,
+        },
+    }
+
+    trail = _add_audit(state, "run_rule_checks", {
+        "expense_count": len(normalized_expenses),
+        "travel_type": travel_type,
+    })
+
+    return {**state, "rule_results": rule_results, "audit_trail": trail}
+
+
+# ---------------------------------------------------------------------------
+# Node 4 – detect_clarification_need
+# ---------------------------------------------------------------------------
+
+def detect_clarification_need(state: ClaimState) -> ClaimState:
+    prompt_dir = ROOT / "agent" / "prompts"
+    system_prompt = (prompt_dir / "system_prompt.md").read_text(encoding="utf-8")
+
+    normalized = state.get("normalized", {})
+    expenses = normalized.get("expenses", [])
+    expense_summaries = []
+    for exp in expenses[:2]:
+        expense_summaries.append({
+            "expense_idx": exp.get("expense_idx"),
+            "vendor": exp.get("vendor"),
+            "category": exp.get("category"),
+            "amount": exp.get("amount"),
+            "date": exp.get("date"),
+            "days_since_expense": exp.get("days_since_expense"),
+            "is_old_expense": exp.get("is_old_expense"),
+            "alcohol_detected": exp.get("alcohol_detected"),
+            "multiple_attendees": exp.get("multiple_attendees"),
+            "raw_text": exp.get("raw_text", "")[:250],
+        })
+
+    user_message = json.dumps({
+        "claim": {
+            "employee_id": normalized.get("employee_id"),
+            "travel_type": normalized.get("travel_type"),
+            "total_amount": normalized.get("total_amount"),
+            "submission_days": normalized.get("submission_days"),
+        },
+        "expenses": expense_summaries,
+        "policy_context": state.get("policy_context", []),
+    }, indent=2, default=str)
+
+    triage_prompt = (
+        "You are a reimbursement triage agent. Decide whether this claim needs "
+        "clarification from the claimant before the final decision can be made. "
+        "Only ask for clarification when critical information is missing. "
+        "Do not ask for clarification about water or lassi; they are non-alcoholic. "
+        "Return a JSON object with exactly these keys: "
+        "{\"needs_clarification\": true|false, \"reasons\": [\"reason\"], "
+        "\"priority\": \"low\"|\"medium\"|\"high\"}.\n\n"
+        f"Claim context:\n{user_message}"
+    )
+
+    try:
+        parsed = _invoke_llm_json(system_prompt, triage_prompt, step="clarification_triage")
+        needs = bool(parsed.get("needs_clarification", False))
+        reasons = parsed.get("reasons", []) if isinstance(parsed.get("reasons"), list) else []
+    except Exception as e:
+        print(f"[workflow] Triage failed, defaulting to no clarification: {e}")
+        needs = False
+        reasons = []
+
+    trail = _add_audit(state, "detect_clarification_need", {
+        "needs_clarification": needs,
+        "reasons": reasons,
+        "llm_provider": "groq",
+    })
+
+    return {**state, "needs_clarification": needs, "audit_trail": trail}
+
+
+# ---------------------------------------------------------------------------
+# Node 5 – generate_clarification_questions
+# ---------------------------------------------------------------------------
+
+def generate_clarification_questions(state: ClaimState) -> ClaimState:
+    prompt_dir = ROOT / "agent" / "prompts"
+    system_prompt = (prompt_dir / "system_prompt.md").read_text(encoding="utf-8")
+
+    # Reduce payload size
+    normalized = state.get("normalized", {})
+    user_message = json.dumps({
+        "total_amount": normalized.get("total_amount"),
+        "travel_type": normalized.get("travel_type"),
+        "expenses": normalized.get("expenses", [])[:2],  # Max 2 expenses
+    }, indent=2, default=str)
+
+    question_prompt = (
+        "Generate 1-3 concise clarification questions. Return JSON: "
+        "{\"questions\": [{\"id\": \"q1\", \"expense_idx\": 0, \"question\": \"..?\", "
+        "\"type\": \"text\"}]}.\n\n"
+        f"Context:\n{user_message}"
+    )
+
+    try:
+        parsed = _invoke_llm_json(system_prompt, question_prompt, step="clarification_questions")
+        questions = parsed.get("questions", []) if isinstance(parsed.get("questions"), list) else []
+    except Exception as e:
+        print(f"[workflow] Question generation failed: {e}")
+        questions = []
+
+    trail = _add_audit(state, "generate_clarification_questions", {
+        "question_count": len(questions),
+        "llm_provider": "groq",
+    })
 
     return {
-        "decision": decision,
-        "approved_amount": round(approved, 2),
-        "rejected_amount": round(rejected, 2),
-        "explanation": "Decision based on automated policy rule checks.",
-        "policy_references": list(set(policy_refs)),
-        "line_items": line_items,
-        "approval_level": rule_results.get("approval_threshold", {}).get(
-            "approval_level", "auto"
-        ),
+        **state,
+        "clarification_questions": questions,
+        "audit_trail": trail,
     }
+
+
+# ---------------------------------------------------------------------------
+# Node 6 – decision_agent
+# ---------------------------------------------------------------------------
+
+def decision_agent(state: ClaimState) -> ClaimState:
+    normalized = state.get("normalized", {})
+    rule_results = state.get("rule_results", {})
+    policy_context = state.get("policy_context", [])
+    clarification_questions = state.get("clarification_questions", [])
+    clarification_answers = state.get("clarification_answers", {})
+
+    expenses = normalized.get("expenses", [])
+    expense_summaries = []
+    for exp in expenses[:3]:
+        item = {k: v for k, v in exp.items() if k not in ["findings", "submission_days"]}
+        item["raw_text"] = exp.get("raw_text", "")[:250]
+        expense_summaries.append(item)
+
+    # Compact Q&A section
+    qa_lines = []
+    for question in clarification_questions[:2]:  # Max 2 Q&A pairs
+        answer = clarification_answers.get(question.get("id"), "N/A")
+        qa_lines.append(f"Q: {question.get('question', '')}\nA: {answer}")
+    qa_section = "\n\n".join(qa_lines) if qa_lines else "None"
+
+    # Limit policy text
+    policy_text = "\n\n---\n\n".join([
+        item.get("chunk", "")[:400] if isinstance(item, dict) else str(item)[:400]
+        for item in policy_context[:3]  # Only 3 chunks
+    ]) if policy_context else "No specific policy context available."
+
+    prompt_dir = ROOT / "agent" / "prompts"
+    system_prompt = (prompt_dir / "system_prompt.md").read_text(encoding="utf-8")
+    decision_template = (prompt_dir / "decision_prompt.md").read_text(encoding="utf-8")
+
+    user_message = decision_template.format(
+        employee_id=normalized.get("employee_id", ""),
+        travel_type=normalized.get("travel_type", "Domestic"),
+        total_amount=normalized.get("total_amount", 0),
+        approval_label=rule_results.get("approval_threshold", {}).get("approval_label", ""),
+        expenses=json.dumps(expense_summaries, indent=2, default=str),
+        rule_results=json.dumps(rule_results, indent=2, default=str),
+        policy_context=policy_text,
+        qa_section=qa_section,
+    )
+
+    try:
+        parsed = _invoke_llm_json(system_prompt, user_message, step="decision_agent")
+        decision_data = _normalize_decision(parsed, normalized)
+
+        validation = validate_output(decision_data)
+        if not validation["valid"]:
+            repair_prompt = (
+                "The previous decision payload was invalid. Repair it so it conforms to the "
+                "required schema and policy instructions. Return only a valid JSON object "
+                "with the same decision structure.\n\n"
+                f"Current payload:\n{json.dumps(decision_data, indent=2, default=str)}"
+            )
+            try:
+                repaired = _invoke_llm_json(system_prompt, repair_prompt, step="decision_repair")
+                if repaired:
+                    decision_data = _normalize_decision(repaired, normalized)
+            except Exception as e:
+                print(f"[workflow] Repair failed, using best-effort decision: {e}")
+    except Exception as e:
+        print(f"[workflow] ⚠️  Decision agent failed: {e}, forcing MANUAL_REVIEW")
+        decision_data = {
+            "decision": "MANUAL_REVIEW",
+            "approved_amount": 0.0,
+            "rejected_amount": float(normalized.get("total_amount", 0)),
+            "explanation": f"Could not process automatically: {str(e)[:100]}",
+            "policy_references": [],
+            "line_items": [],
+        }
+
+    trail = _add_audit(state, "decision_agent", {
+        "source": "groq",
+        "decision": decision_data.get("decision"),
+        "approved_amount": decision_data.get("approved_amount"),
+        "llm_provider": "groq",
+    })
+
+    return {**state, "decision": decision_data, "audit_trail": trail}
 
 
 # ---------------------------------------------------------------------------
@@ -613,13 +488,12 @@ def validate_decision_output(state: ClaimState) -> ClaimState:
     result = validate_output(decision)
 
     if not result["valid"]:
-        # Patch what we can rather than failing the whole claim
-        if not decision.get("explanation"):
-            decision["explanation"] = "Decision generated by workflow."
-        if decision.get("decision") not in {
-            "APPROVED", "PARTIAL", "REJECTED", "MANUAL_REVIEW"
-        }:
-            decision["decision"] = "MANUAL_REVIEW"
+        decision.setdefault("explanation", "Decision generated by workflow.")
+        decision.setdefault("decision", "MANUAL_REVIEW")
+        decision.setdefault("approved_amount", 0.0)
+        decision.setdefault("rejected_amount", 0.0)
+        decision.setdefault("policy_references", [])
+        decision.setdefault("line_items", [])
 
     trail = _add_audit(state, "validate_decision_output", {
         "valid": result["valid"],
@@ -634,11 +508,7 @@ def validate_decision_output(state: ClaimState) -> ClaimState:
 # ---------------------------------------------------------------------------
 
 def _route_after_clarification_check(state: ClaimState) -> str:
-    return (
-        "generate_clarification_questions"
-        if state.get("needs_clarification")
-        else "decision_agent"
-    )
+    return "generate_clarification_questions" if state.get("needs_clarification") else "decision_agent"
 
 
 def build_workflow():

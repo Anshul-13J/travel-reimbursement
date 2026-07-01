@@ -9,16 +9,19 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 # ---------------------------------------------------------------------------
-# Make the project root importable so agent/ and tools/ can be resolved
+# Make the project root and backend importable so agent/ and tools/ can be resolved
 # regardless of which directory uvicorn is launched from.
 # ---------------------------------------------------------------------------
 ROOT = Path(__file__).parent.parent
+BACKEND_ROOT = Path(__file__).parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
+if str(BACKEND_ROOT) not in sys.path:
+    sys.path.insert(0, str(BACKEND_ROOT))
 
 from ocr.factory import get_ocr
 from extraction.parser import ReceiptParser
-from llm.grok_client import check_grok_health
+from llm.groq_client import check_groq_health
 from agent.workflow import (
     workflow,
     decision_agent,
@@ -86,9 +89,14 @@ def health():
     return {"healthy": True}
 
 
+@app.get("/groq/health")
+def groq_health():
+    return check_groq_health()
+
+
 @app.get("/grok/health")
 def grok_health():
-    return check_grok_health()
+    return check_groq_health()
 
 # ---------------------------------------------------------------------------
 # Endpoint — OCR (existing)
@@ -150,6 +158,7 @@ def submit_claim(payload: ClaimPayload):
 
     try:
         result = workflow.invoke(initial_state)
+        print("Done")
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
