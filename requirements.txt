@@ -11,7 +11,3 @@ langchain-community
 langchain-ollama
 pydantic
 python-dateutil
-chromadb
-langchain-chroma
-unstructured
-unstructured[md]
