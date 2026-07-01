@@ -153,4 +153,4 @@ Policies live in `policies/` as Markdown documents. `rag/build_index.py` indexes
 
 ## Demo link
 NOTE: any APIs in the video have already been revoked
-![Demo Video](https://drive.google.com/file/d/1ZCyDHFc7V9lUrU9a9OpGRFe0HvaZxKW8/view?usp=drive_link)
+[Demo Video](https://drive.google.com/file/d/1ZCyDHFc7V9lUrU9a9OpGRFe0HvaZxKW8/view?usp=drive_link)
