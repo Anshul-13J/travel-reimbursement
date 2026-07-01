@@ -19,31 +19,7 @@ This project connects multiple AI components into a single claims pipeline:
 
 ## Architecture
 
-```
-Streamlit Frontend
-        │
-        ▼
-FastAPI Backend (/backend/api.py)
-  ├─ POST /ocr → receipt OCR + local LLM parsing
-  ├─ POST /submit → LangGraph workflow
-  ├─ POST /claims/{id}/answers → clarification handling
-  └─ GET /groq/health → Groq health
-        │
-        ▼
-LangGraph Workflow (/agent/workflow.py)
-  ┌───────────────────────────────────────────────────┐
-  │ 1. normalize_claim                                │
-  │ 2. retrieve_policy_context (Chroma/RAG fallback)  │
-  │ 3. run_rule_checks                                │
-  │ 4. detect_clarification_need                      │
-  │ 5. generate_clarification_questions               │
-  │ 6. decision_agent (Groq LLM)                      │
-  │ 7. validate_decision_output                       │
-  └───────────────────────────────────────────────────┘
-        │
-        ▼
-  Policy Retrieval & Groq Decisioning
-```
+![image](architecture.png)
 
 ## Detailed Architecture
 
